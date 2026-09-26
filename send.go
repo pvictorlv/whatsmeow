@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -379,6 +380,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 
 	start := time.Now()
 	// Sending multiple messages at a time can cause weird issues and makes it harder to retry safely
+	// This is also required for the session prefetching that makes group sends faster
+	// (everything will explode if you send a message to the same user twice in parallel)
 	cli.messageSendLock.Lock()
 	resp.DebugTimings.Queue = time.Since(start)
 	defer cli.messageSendLock.Unlock()
@@ -1181,6 +1184,12 @@ func (cli *Client) prepareMessageNode(
 		return nil, nil, fmt.Errorf("failed to get device list: %w", err)
 	}
 
+	if to.Server == types.GroupServer {
+		allDevices = slices.DeleteFunc(allDevices, func(jid types.JID) bool {
+			return jid.Server == types.HostedServer || jid.Server == types.HostedLIDServer
+		})
+	}
+
 	msgType := getTypeFromMessage(message)
 	encAttrs := waBinary.Attrs{}
 	// Only include encMediaType for 1:1 messages (groups don't have a device-sent message plaintext)
@@ -1288,77 +1297,39 @@ func (cli *Client) encryptMessageForDevices(
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to fetch LID mappings: %w", err)
 	}
+	cli.fillMissingLIDsFromServer(ctx, pnDevices, lidMappings)
 
 	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
-	var sessionAddresses []string
+	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
+	sessionAddresses := make([]string, 0, len(allDevices))
 	for _, jid := range allDevices {
 		if jid == ownJID || jid == ownLID {
 			continue
 		}
 		encryptionIdentity := jid
 		if jid.Server == types.DefaultUserServer {
-			// TODO query LID from server for missing entries
 			if lidForPN, ok := lidMappings[jid]; ok && !lidForPN.IsEmpty() {
 				cli.migrateSessionStore(ctx, jid, lidForPN)
 				encryptionIdentity = lidForPN
 			}
 		}
 		encryptionIdentities[jid] = encryptionIdentity
-		sessionAddresses = append(sessionAddresses, encryptionIdentity.SignalAddress().String())
+		addr := encryptionIdentity.SignalAddress().String()
+		sessionAddresses = append(sessionAddresses, addr)
+		sessionAddressToJID[addr] = jid
 	}
 
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to check which sessions exist: %w", err)
+		return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
 	}
-
-	var retryDevices, retryEncryptionIdentities []types.JID
-	jidLidMap := make(map[types.JID]types.JID)
-	usyncDeviceList := make(map[types.JID][]uint16) // bare JID -> device IDs
-
-	for _, jid := range allDevices {
-		if jid.Server == types.DefaultUserServer {
-			lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
-			if err != nil {
-				cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
-			}
-
-			if !lidForPN.IsEmpty() {
-				jidLidMap[jid] = lidForPN
-			} else {
-				bare := jid.ToNonAD()
-				usyncDeviceList[bare] = append(usyncDeviceList[bare], jid.Device)
-			}
-
+	var retryDevices []types.JID
+	for addr, exists := range existingSessions {
+		if !exists {
+			retryDevices = append(retryDevices, sessionAddressToJID[addr])
 		}
 	}
-
-	if len(usyncDeviceList) > 0 {
-		usyncJids := make([]types.JID, 0, len(usyncDeviceList))
-		for bare := range usyncDeviceList {
-			usyncJids = append(usyncJids, bare)
-		}
-
-		info, err := cli.GetUserInfo(ctx, usyncJids)
-		if err != nil {
-			cli.Log.Warnf("Failed to get LID info from USync, err: %v", err)
-		} else {
-			for bare, userInfo := range info {
-				if userInfo.LID.IsEmpty() {
-					continue
-				}
-				for _, deviceID := range usyncDeviceList[bare] {
-					jid := bare
-					jid.Device = deviceID
-
-					lid := userInfo.LID
-					lid.Device = deviceID
-
-					jidLidMap[jid] = lid
-				}
-			}
-		}
-	}
+	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
 
 	for _, jid := range allDevices {
 		plaintext := msgPlaintext
@@ -1368,23 +1339,10 @@ func (cli *Client) encryptMessageForDevices(
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
 			plaintext = dsmPlaintext
 		}
-
-		encryptionIdentity := jid
-		if jid.Server == types.DefaultUserServer {
-			if lid, ok := jidLidMap[jid]; ok && !lid.IsEmpty() {
-				cli.migrateSessionStore(ctx, jid, lid)
-				encryptionIdentity = lid
-			}
-		}
-
 		encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
-			ctx, plaintext, jid, encryptionIdentity, nil, encAttrs, existingSessions,
+			ctx, plaintext, jid, encryptionIdentities[jid], bundles[jid], encAttrs, existingSessions,
 		)
-		if errors.Is(err, ErrNoSession) {
-			retryDevices = append(retryDevices, jid)
-			retryEncryptionIdentities = append(retryEncryptionIdentities, encryptionIdentity)
-			continue
-		} else if err != nil {
+		if err != nil {
 			// TODO return these errors if it's a fatal one (like context cancellation or database)
 			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
 			if ctx.Err() != nil {
@@ -1398,41 +1356,50 @@ func (cli *Client) encryptMessageForDevices(
 			includeIdentity = true
 		}
 	}
-	if len(retryDevices) > 0 {
-		bundles, err := cli.fetchPreKeys(ctx, retryDevices)
-		if err != nil {
-			cli.Log.Warnf("Failed to fetch prekeys for %v to retry encryption: %v", retryDevices, err)
-		} else {
-			for i, jid := range retryDevices {
-				resp := bundles[jid]
-				if resp.err != nil {
-					cli.Log.Warnf("Failed to fetch prekey for %s: %v", jid, resp.err)
-					continue
-				}
-				plaintext := msgPlaintext
-				if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
-					plaintext = dsmPlaintext
-				}
-				encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
-					ctx, plaintext, jid, retryEncryptionIdentities[i], resp.bundle, encAttrs, nil,
-				)
-				if err != nil {
-					// TODO return these errors if it's a fatal one (like context cancellation or database)
-					cli.Log.Warnf("Failed to encrypt %s for %s (retry): %v", id, jid, err)
-					continue
-				}
-				participantNodes = append(participantNodes, *encrypted)
-				if isPreKey {
-					includeIdentity = true
-				}
-			}
-		}
-	}
 	err = cli.Store.PutCachedSessions(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
 	}
 	return participantNodes, includeIdentity, nil
+}
+
+// fillMissingLIDsFromServer asks the server (usync) for the LID of PN devices
+// that have no local mapping, so the message is encrypted for the LID session
+// instead of silently falling back to the phone number. GetUserInfo persists
+// the mappings it learns, so this only costs a round trip once per user.
+func (cli *Client) fillMissingLIDsFromServer(ctx context.Context, pnDevices []types.JID, lidMappings map[types.JID]types.JID) {
+	missing := make(map[types.JID][]uint16)
+	for _, jid := range pnDevices {
+		if lid, ok := lidMappings[jid]; ok && !lid.IsEmpty() {
+			continue
+		}
+		bare := jid.ToNonAD()
+		missing[bare] = append(missing[bare], jid.Device)
+	}
+	if len(missing) == 0 {
+		return
+	}
+	bareJIDs := make([]types.JID, 0, len(missing))
+	for bare := range missing {
+		bareJIDs = append(bareJIDs, bare)
+	}
+	info, err := cli.GetUserInfo(ctx, bareJIDs)
+	if err != nil {
+		cli.Log.Warnf("Failed to get LIDs from usync for %d users: %v", len(bareJIDs), err)
+		return
+	}
+	for bare, userInfo := range info {
+		if userInfo.LID.IsEmpty() {
+			continue
+		}
+		for _, device := range missing[bare] {
+			pn := bare
+			pn.Device = device
+			lid := userInfo.LID
+			lid.Device = device
+			lidMappings[pn] = lid
+		}
+	}
 }
 
 func (cli *Client) encryptMessageForDeviceAndWrap(
