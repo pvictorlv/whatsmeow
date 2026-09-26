@@ -68,16 +68,16 @@ func getRetryReasonFromError(err error) int {
 	switch {
 	case errors.Is(err, signalerror.ErrBadMAC):
 		return RetryReasonSignalErrorBadMac
-	case errors.Is(err, signalerror.ErrNoSessionForUser):
-	case errors.Is(err, signalerror.ErrNoSenderKeyForUser):
+	case errors.Is(err, signalerror.ErrNoSessionForUser),
+		errors.Is(err, signalerror.ErrNoSenderKeyForUser):
 		return RetryReasonSignalErrorNoSession
-	case errors.Is(err, signalerror.ErrWrongMessageVersion):
-	case errors.Is(err, signalerror.ErrOldMessageVersion):
-	case errors.Is(err, signalerror.ErrUnknownMessageVersion):
-	case errors.Is(err, signalerror.ErrIncompleteMessage):
+	case errors.Is(err, signalerror.ErrWrongMessageVersion),
+		errors.Is(err, signalerror.ErrOldMessageVersion),
+		errors.Is(err, signalerror.ErrUnknownMessageVersion),
+		errors.Is(err, signalerror.ErrIncompleteMessage):
 		return RetryReasonSignalErrorInvalidMessage
-	case errors.Is(err, signalerror.ErrInvalidSignature):
-	case errors.Is(err, signalerror.ErrSenderKeyStateVerificationFailed):
+	case errors.Is(err, signalerror.ErrInvalidSignature),
+		errors.Is(err, signalerror.ErrSenderKeyStateVerificationFailed):
 		return RetryReasonSignalErrorInvalidSignature
 	case errors.Is(err, signalerror.ErrNoSignedPreKey):
 		return RetryReasonSignalErrorInvalidKey
